@@ -4,7 +4,7 @@
 
 This is the steps I took to get this project up and running. I'm using VSCode as my IDE.
 
-Install [espup](https://github.com/esp-rs/espup#installation) and the toolchain.
+### Install [espup](https://github.com/esp-rs/espup#installation) and the toolchain.
 
 ```bash
 cargo install espup
@@ -19,17 +19,26 @@ espup install
 # [2023-09-13T17:17:50Z INFO ] ✅  Installation successfully completed!
 ```
 
-Install the `espflash` tool
+### Install [espflash](https://github.com/esp-rs/espflash/tree/main/espflash)
 ```bash
 cargo install espflash
 ```
 
-Switch to the esp toolchain
+### Switch to the esp toolchain
 ```bash
 rustup override set esp
+
+# Or if you want to switch back to the default toolchain
+rustup override unset
+
+# If you want to get rin of Better TOML errors, you'll need to set as default
+rustup default esp
+
+# And if you want to switch back to the default toolchain
+rustup default stable
 ```
 
-Set permissions for the USB device
+### Set permissions for the USB device
 ```bash
 # Get the USB device id
 lsusb # Bus 001 Device 017: ID 1a86:55d4 QinHeng Electronics USB Single Serial
@@ -52,6 +61,15 @@ sudo usermod -a -G plugdev $USER
 # Unplug and plug the device back in
 ```
 
+## Build and flash the project
+```bash
+# Runner configured in .cargo/config.toml 
+cargo run
+
+# Flash the device
+espflash flash target/xtensa-esp32-none-elf/release/ttgo-playground --monitor
+```
+
 ## References
 
 - https://github.com/ivmarkov/rust-esp32-std-demo
@@ -59,3 +77,4 @@ sudo usermod -a -G plugdev $USER
 - https://github.com/esp-rs/rust-build#espup-installation
 - https://github.com/esp-rs/espup#installation
 - https://github.com/esp-rs/no_std-training
+- https://esp-rs.github.io/book/introduction.html

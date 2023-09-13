@@ -1,2 +1,5 @@
+# https://esp-rs.github.io/book/tooling/visual-studio-code.html#cargo-hints-when-using-custom-toolchains
 [toolchain]
 channel = "esp"
+components = ["rustfmt", "rustc-dev"]
+targets = ["xtensa-esp32-none-elf"]

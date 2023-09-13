@@ -1,6 +1,12 @@
 {
+  // https://esp-rs.github.io/book/tooling/visual-studio-code.html
+  "rust-analyzer.check.allTargets": false,
+  "rust-analyzer.cargo.target": "xtensa-esp32-none-elf",
+  "rust-analyzer.checkOnSave": true,
   "cSpell.words": [
+    "espflash",
     "espup",
+    "rustup",
     "TTGO"
   ]
 }
