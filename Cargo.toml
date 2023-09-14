@@ -9,3 +9,9 @@ edition = "2021"
 hal = { package = "esp32-hal", version = "0.15.0" }
 esp-backtrace = { version = "0.8.0", features = ["esp32", "panic-handler", "exception-handler", "print-uart"] }
 esp-println = { version = "0.6.0", features = ["esp32"] }
+esp-storage ={ version = "0.3.0", features = ["esp32", "storage"] }
+embedded-storage = { version = "0.3.0" }
+
+# https://github.com/esp-rs/esp-storage/tree/main#important
+[profile.dev.package.esp-storage]
+opt-level = 3

@@ -14,9 +14,9 @@ espup --version
 
 # Install the toolchain
 espup install
-# [2023-09-13T17:17:50Z WARN ] 💡  Please, set up the environment variables by running: '. ~/export-esp.sh'
-# [2023-09-13T17:17:50Z WARN ] ⚠️   This step must be done every time you open a new terminal.
-# [2023-09-13T17:17:50Z INFO ] ✅  Installation successfully completed!
+# 💡  Please, set up the environment variables by running: '. ~/export-esp.sh'
+# ⚠️   This step must be done every time you open a new terminal.
+# ✅  Installation successfully completed!
 ```
 
 ### Install [espflash](https://github.com/esp-rs/espflash/tree/main/espflash)
@@ -24,7 +24,7 @@ espup install
 cargo install espflash
 ```
 
-### Switch to the esp toolchain
+### Switch to the esp toolchain (optional as rust-toolchain.toml does it)
 ```bash
 rustup override set esp
 
