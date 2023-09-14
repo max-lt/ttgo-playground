@@ -1,11 +1,11 @@
-#![no_std]
-#![no_main]
 
 use embedded_storage::{ReadStorage, Storage};
+// use embedded_hal::digital::v2::OutputPin;
 use esp_backtrace as _;
 use esp_println::println;
 use esp_storage::FlashStorage;
 use hal::{clock::ClockControl, peripherals::Peripherals, prelude::*, Delay, IO};
+use esp_idf_hal::gpio;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ButtonState {
@@ -108,9 +108,10 @@ fn main() -> ! {
     println!("Hello world!");
 
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
+    let pins = io.pins;
 
-    let left_button_ctr = io.pins.gpio0.into_pull_up_input();
-    let right_button_ctr = io.pins.gpio35.into_pull_up_input();
+    let left_button_ctr = pins.gpio0.into_pull_up_input();
+    let right_button_ctr = pins.gpio35.into_pull_up_input();
 
     let mut flash = FlashStorage::new();
     let flash_offset = 0x9000;
@@ -127,6 +128,51 @@ fn main() -> ! {
         left_button.count(),
         right_button.count()
     );
+
+    {
+        let mut backlight = pins.gpio4.into_push_pull_output();
+
+        let dc = pins.gpio16; // Data/Command (data or command signal from main to subs)
+        let mut rst = pins.gpio23.into_push_pull_output(); // Reset (active low signal from main to reset subs)
+        let spi = peripherals.SPI2; // Serial Peripheral Interface
+        let sclk = pins.gpio18; // SCLK : Serial Clock (clock signal from main)
+        let sdo = pins.gpio19; // mosi: Main Out Sub In (data output from main)
+        let cs = pins.gpio5; // Chip Select (active low signal from main to address subs and initiate transmission)
+
+        backlight.set_high().unwrap();
+
+        println!("Reset screen");
+
+        // rst.set_low().unwrap();
+
+        // let di = SPIInterfaceNoCS::new(
+        //     spi::SpiDeviceDriver::new_single(
+        //         spi,
+        //         sclk,
+        //         sdo,
+        //         Option::<gpio::Gpio21>::None,
+        //         Some(cs),
+        //         &spi::SpiDriverConfig::new().dma(spi::Dma::Disabled),
+        //         &spi::SpiConfig::new().baudrate(26.MHz().into()),
+        //     )?,
+        //     gpio::PinDriver::output(dc)?,
+        // );
+
+        // let mut display = mipidsi::Builder::st7789(di)
+        //     .init(&mut delay::Ets, Some(gpio::PinDriver::output(rst)?))
+        //     .map_err(|e| anyhow::anyhow!("Display error: {:?}", e))?;
+
+        // display
+        //     .set_orientation(mipidsi::options::Orientation::Portrait(false))
+        //     .map_err(|e| anyhow::anyhow!("Display error: {:?}", e))?;
+
+        // // The TTGO board's screen does not start at offset 0x0, and the physical size is 135x240, instead of 240x320
+        // let top_left = Point::new(52, 40);
+        // let size = Size::new(135, 240);
+
+        // led_draw(&mut display.cropped(&Rectangle::new(top_left, size)))
+        //     .map_err(|e| anyhow::anyhow!("Display error: {:?}", e))
+    };
 
     loop {
         {
