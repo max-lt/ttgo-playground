@@ -5,6 +5,8 @@ runner = "espflash flash --monitor"
 rustflags = [
   "-C", "link-arg=-Tlinkall.x",
   "-C", "link-arg=-nostartfiles",
+  # https://github.com/esp-rs/esp-wifi#link-configuration
+  "-C", "link-arg=-Trom_functions.x",
 ]
 
 target = "xtensa-esp32-none-elf"
