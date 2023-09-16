@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod snake;
+
 use embedded_storage::ReadStorage;
 use embedded_storage::Storage;
 use esp_backtrace as _;
@@ -215,21 +217,13 @@ fn main() -> ! {
     let mut display = {
         // https://github.com/Xinyuan-LilyGO/TTGO-T-Display#pinout
         let mut bl = pins.gpio4.into_push_pull_output();
-        let mut rst = pins.gpio23.into_push_pull_output(); // Reset (active low signal from main to reset subs)
+        let rst = pins.gpio23.into_push_pull_output(); // Reset (active low signal from main to reset subs)
         let dc = pins.gpio16.into_push_pull_output(); // Data/Command (data or command signal from main to subs)
         let spi = peripherals.SPI2; // Serial Peripheral Interface
         let sck = pins.gpio18; // SCLK : Serial Clock (clock signal from main)
         let mosi = pins.gpio19; // mosi: Main Out Sub In (data output from main)
         let miso = pins.gpio21; // ?? MISO is not connected on the TTGO board
         let cs = pins.gpio5; // Chip Select (active low signal from main to address subs and initiate transmission)
-
-        // Turn on the backlight
-        bl.set_high().unwrap();
-
-        // Reset the screen
-        rst.set_low().unwrap();
-        delay.delay_ms(10u32);
-        rst.set_high().unwrap();
 
         // create SPI interface
         let spi = spi::Spi::new(
@@ -255,6 +249,9 @@ fn main() -> ! {
             Ok(_) => println!("Screen cleared"),
             Err(_) => println!("Failed to clear screen"),
         }
+
+        // Turn on the backlight
+        bl.set_high().unwrap();
 
         display
             .set_orientation(mipidsi::options::Orientation::Portrait(false))
@@ -293,6 +290,10 @@ fn main() -> ! {
         area
     };
 
+    let mut game = snake::Game::new();
+
+    game.init(&mut area);
+
     loop {
         {
             left_button.update(left_button_ctr.is_high().unwrap());
@@ -322,6 +323,8 @@ fn main() -> ! {
                 draw_text(&mut area, 80, 60, buf.to_str()).unwrap();
 
                 println!("Left button pressed: {}", left_button.count());
+
+                game.change_direction(snake::DirectionChange::Left);
             }
             (_, ButtonState::JustPressed) => {
                 right_button.increment();
@@ -331,11 +334,15 @@ fn main() -> ! {
                 draw_text(&mut area, 80, 80, buf.to_str()).unwrap();
 
                 println!("Right button pressed: {}", right_button.count());
+
+                game.change_direction(snake::DirectionChange::Right);
             }
             (ButtonState::JustReleased, _) => println!("Left button released"),
             (_, ButtonState::JustReleased) => println!("Right button released"),
             _ => {}
         }
+
+        game.move_snake(&mut area);
 
         delay.delay_ms(100u32);
     }
