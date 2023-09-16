@@ -1,11 +1,26 @@
 #![no_std]
 #![no_main]
 
-use embedded_storage::{ReadStorage, Storage};
+use embedded_storage::ReadStorage;
+use embedded_storage::Storage;
 use esp_backtrace as _;
 use esp_println::println;
 use esp_storage::FlashStorage;
-use hal::{clock::ClockControl, peripherals::Peripherals, prelude::*, Delay, IO};
+use hal::clock::ClockControl;
+use hal::peripherals::Peripherals;
+use hal::prelude::*;
+use hal::spi;
+use hal::Delay;
+use hal::IO;
+
+// Screen
+use display_interface_spi::SPIInterfaceNoCS;
+use embedded_graphics::draw_target::DrawTarget;
+use embedded_graphics::mono_font::{ascii::FONT_10X20, MonoTextStyle};
+use embedded_graphics::pixelcolor::RgbColor;
+use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::*;
+use embedded_graphics::text::Text;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ButtonState {
@@ -101,16 +116,17 @@ fn check_memory(flash: &mut FlashStorage, flash_offset: u32) {
 #[entry]
 fn main() -> ! {
     let peripherals = Peripherals::take();
-    let system = peripherals.DPORT.split();
+    let mut system = peripherals.DPORT.split();
     let clocks = ClockControl::boot_defaults(system.clock_control).freeze();
     let mut delay = Delay::new(&clocks);
 
     println!("Hello world!");
 
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
+    let pins = io.pins;
 
-    let left_button_ctr = io.pins.gpio0.into_pull_up_input();
-    let right_button_ctr = io.pins.gpio35.into_pull_up_input();
+    let left_button_ctr = pins.gpio0.into_pull_up_input();
+    let right_button_ctr = pins.gpio35.into_pull_up_input();
 
     let mut flash = FlashStorage::new();
     let flash_offset = 0x9000;
@@ -127,6 +143,63 @@ fn main() -> ! {
         left_button.count(),
         right_button.count()
     );
+
+    // Display
+    {
+        // https://github.com/Xinyuan-LilyGO/TTGO-T-Display#pinout
+        let mut bl = pins.gpio4.into_push_pull_output();
+        let dc = pins.gpio16.into_push_pull_output(); // Data/Command (data or command signal from main to subs)
+        let rst = pins.gpio23.into_push_pull_output(); // Reset (active low signal from main to reset subs)
+        let spi = peripherals.SPI2; // Serial Peripheral Interface
+        let sck = pins.gpio18; // SCLK : Serial Clock (clock signal from main)
+        let mosi = pins.gpio19; // mosi: Main Out Sub In (data output from main)
+        let miso = pins.gpio21; // ?? miso: Main In Sub Out (data input to main)
+        let cs = pins.gpio5; // Chip Select (active low signal from main to address subs and initiate transmission)
+
+        // create SPI interface
+        let spi = spi::Spi::new(
+            spi,
+            sck,
+            mosi,
+            miso,
+            cs,
+            26u32.MHz(),
+            spi::SpiMode::Mode0,
+            &mut system.peripheral_clock_control,
+            &clocks,
+        );
+
+        // display interface abstraction from SPI and DC
+        let di = SPIInterfaceNoCS::new(spi, dc);
+
+        let mut display = mipidsi::Builder::st7789(di)
+            .init(&mut delay, Some(rst))
+            .unwrap();
+
+        match display.clear(RgbColor::BLUE) {
+            Ok(_) => println!("Screen cleared"),
+            Err(_) => println!("Failed to clear screen"),
+        }
+
+        display
+            .set_orientation(mipidsi::options::Orientation::LandscapeInverted(true))
+            .unwrap();
+
+        // The TTGO board's screen does not start at offset 0x0, and the physical size is 135x240, instead of 240x320
+        let top_left = Point::new(52, 40);
+        let size = Size::new(135, 240);
+        let mut display = display.cropped(&Rectangle::new(top_left, size));
+
+        Text::new(
+            "Hello World!",
+            Point::new(10, (display.bounding_box().size.height - 10) as i32 / 2),
+            MonoTextStyle::new(&FONT_10X20, RgbColor::WHITE),
+        )
+        .draw(&mut display)
+        .unwrap();
+
+        bl.set_high().unwrap();
+    }
 
     loop {
         {
