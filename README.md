@@ -78,3 +78,4 @@ espflash flash target/xtensa-esp32-none-elf/release/ttgo-playground --monitor
 - https://github.com/esp-rs/espup#installation
 - https://github.com/esp-rs/no_std-training
 - https://esp-rs.github.io/book/introduction.html
+- https://github.com/Xinyuan-LilyGO/TTGO-T-Display#pinout

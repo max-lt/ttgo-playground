@@ -10,7 +10,7 @@ hal = { package = "esp32-hal", version = "0.15.0" }
 esp-backtrace = { version = "0.8.0", features = ["esp32", "panic-handler", "exception-handler", "print-uart"] }
 esp-println = { version = "0.6.0", features = ["esp32"] }
 # Storage
-esp-storage ={ version = "0.3.0", features = ["esp32", "storage"] }
+esp-storage = { version = "0.3.0", features = ["esp32", "storage"] }
 embedded-storage = { version = "0.3.0" }
 # Display
 mipidsi = "0.7.1"
