@@ -7,12 +7,21 @@ This is the steps I took to get this project up and running. I'm using VSCode as
 ### Install [espup](https://github.com/esp-rs/espup#installation) and the toolchain.
 
 ```bash
-cargo install espup
+# NOTE: `cargo install espup` FAILS from inside this repo — rust-toolchain.toml pins
+# `channel = "esp"`, which isn't installed yet. Run it from your home dir, force
+# +stable, or (fastest) grab the prebuilt binary:
+
+# macOS (Apple Silicon), no compile:
+curl -L https://github.com/esp-rs/espup/releases/latest/download/espup-aarch64-apple-darwin \
+  -o ~/.cargo/bin/espup && chmod +x ~/.cargo/bin/espup
+# ...or build it (run OUTSIDE this repo, or force stable):
+cargo +stable install espup
 
 # Check that it's installed
 espup --version
 
-# Install the toolchain
+# Install the esp toolchain + Xtensa target + LLVM (~1-2 GB). The default (latest) is
+# fine: this project targets esp-hal 1.1, which builds on the current esp toolchain.
 espup install
 # 💡  Please, set up the environment variables by running: '. ~/export-esp.sh'
 # ⚠️   This step must be done every time you open a new terminal.
@@ -21,6 +30,8 @@ espup install
 
 ### Install [espflash](https://github.com/esp-rs/espflash/tree/main/espflash)
 ```bash
+# Same caveat as espup: run OUTSIDE this repo (the .cargo/config.toml `target = xtensa`
+# override otherwise makes cargo try to build espflash for the wrong target).
 cargo install espflash
 ```
 
@@ -38,7 +49,21 @@ rustup default esp
 rustup default stable
 ```
 
-### Set permissions for the USB device
+### USB serial device
+
+#### macOS
+
+Recent macOS ships the CP210x / CH34x USB-serial drivers built in, so the T-Display
+usually just works. Plug it in and confirm it enumerates:
+
+```bash
+ls /dev/cu.*   # look for /dev/cu.usbserial-* or /dev/cu.wchusbserial-*
+```
+
+If nothing new appears when you plug it in, install the vendor driver
+(Silicon Labs CP210x, or WCH CH34x for the CH9102).
+
+#### Linux (udev)
 ```bash
 # Get the USB device id
 lsusb # Bus 001 Device 017: ID 1a86:55d4 QinHeng Electronics USB Single Serial
@@ -64,10 +89,10 @@ sudo usermod -a -G plugdev $USER
 ## Build and flash the project
 ```bash
 # Runner configured in .cargo/config.toml 
-cargo run
+cargo run --release
 
-# Flash the device
-espflash flash target/xtensa-esp32-none-elf/release/ttgo-playground --monitor
+# ...or flash the already-built binary directly (lighter; no cargo/toolchain env needed):
+espflash flash --monitor target/xtensa-esp32-none-elf/release/ttgo-playground
 ```
 
 ## References
