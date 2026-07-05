@@ -3,11 +3,11 @@ runner = "espflash flash --monitor"
 
 [build]
 rustflags = [
-  "-C", "link-arg=-Tlinkall.x",
+  "-C", "link-arg=-Wl,-Tlinkall.x",
   "-C", "link-arg=-nostartfiles",
 ]
 
 target = "xtensa-esp32-none-elf"
 
 [unstable]
-build-std = ["core"]
+build-std = ["core", "alloc"]

@@ -8,24 +8,31 @@ use embedded_storage::Storage;
 use esp_backtrace as _;
 use esp_println::println;
 use esp_storage::FlashStorage;
-use hal::clock::ClockControl;
-use hal::peripherals::Peripherals;
-use hal::prelude::*;
-use hal::spi;
-use hal::Delay;
-use hal::IO;
 
-use core::fmt::Formatter;
+use esp_hal::delay::Delay;
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::main;
+use esp_hal::spi::master::{Config as SpiConfig, Spi};
+use esp_hal::spi::Mode;
+use esp_hal::time::Rate;
+
 use core::fmt::Write;
 
 // Screen
-use display_interface_spi::SPIInterfaceNoCS;
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::mono_font::{ascii::FONT_10X20, MonoTextStyle};
 use embedded_graphics::pixelcolor::RgbColor;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::*;
 use embedded_graphics::text::Text;
+use embedded_hal_bus::spi::ExclusiveDevice;
+use mipidsi::interface::SpiInterface;
+use mipidsi::models::ST7789;
+use mipidsi::options::Orientation;
+use mipidsi::Builder;
+
+// The ESP-IDF bootloader (what espflash writes) needs an app descriptor to boot.
+esp_bootloader_esp_idf::esp_app_desc!();
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ButtonState {
@@ -78,13 +85,13 @@ impl Button {
         self.count += 1;
     }
 
-    pub fn write(&self, flash: &mut FlashStorage) {
+    pub fn write(&self, flash: &mut FlashStorage<'_>) {
         flash
             .write(self.flash_offset, self.count.to_le_bytes().as_ref())
             .expect("Failed to write to flash");
     }
 
-    pub fn read(&mut self, flash: &mut FlashStorage) {
+    pub fn read(&mut self, flash: &mut FlashStorage<'_>) {
         let mut data = [0u8; 4];
 
         flash
@@ -98,7 +105,7 @@ impl Button {
 const MAGIC: u32 = 0xab01cd02;
 
 /// Check if the magic is written, if not, write it and clear the rest of the used flash
-fn check_memory(flash: &mut FlashStorage, flash_offset: u32) {
+fn check_memory(flash: &mut FlashStorage<'_>, flash_offset: u32) {
     println!("Flash size = {}", flash.capacity());
 
     if flash.capacity() < 128 {
@@ -176,29 +183,27 @@ impl Write for Buf {
     }
 }
 
-#[entry]
+#[main]
 fn main() -> ! {
-    let peripherals = Peripherals::take();
-    let mut system = peripherals.DPORT.split();
-    let clocks = ClockControl::boot_defaults(system.clock_control).freeze();
-    let mut delay = Delay::new(&clocks);
+    let peripherals = esp_hal::init(esp_hal::Config::default());
+
+    let mut delay = Delay::new();
 
     println!("Hello world!");
 
-    let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
-    let pins = io.pins;
+    // Buttons: GPIO0 (left) and GPIO35 (right), pulled up (low = pressed)
+    let input_config = InputConfig::default().with_pull(Pull::Up);
+    let left_input = Input::new(peripherals.GPIO0, input_config);
+    let right_input = Input::new(peripherals.GPIO35, input_config);
 
-    let left_button_ctr = pins.gpio0.into_pull_up_input();
-    let right_button_ctr = pins.gpio35.into_pull_up_input();
-
-    let mut flash = FlashStorage::new();
+    let mut flash = FlashStorage::new(peripherals.FLASH);
     let flash_offset = 0x9000;
     check_memory(&mut flash, flash_offset);
 
-    let mut left_button = Button::new(left_button_ctr.number(), flash_offset + 4);
+    let mut left_button = Button::new(0, flash_offset + 4);
     left_button.read(&mut flash);
 
-    let mut right_button = Button::new(right_button_ctr.number(), flash_offset + 8);
+    let mut right_button = Button::new(35, flash_offset + 8);
     right_button.read(&mut flash);
 
     println!(
@@ -213,36 +218,38 @@ fn main() -> ! {
         len: 0,
     };
 
+    // Backlight pin, kept alive for the whole program. Off until the display is ready.
+    let mut bl = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
+
+    // Scratch buffer for the mipidsi SPI interface; must outlive `display`.
+    let mut buffer = [0u8; 512];
+
     // Display
     let mut display = {
         // https://github.com/Xinyuan-LilyGO/TTGO-T-Display#pinout
-        let mut bl = pins.gpio4.into_push_pull_output();
-        let rst = pins.gpio23.into_push_pull_output(); // Reset (active low signal from main to reset subs)
-        let dc = pins.gpio16.into_push_pull_output(); // Data/Command (data or command signal from main to subs)
-        let spi = peripherals.SPI2; // Serial Peripheral Interface
-        let sck = pins.gpio18; // SCLK : Serial Clock (clock signal from main)
-        let mosi = pins.gpio19; // mosi: Main Out Sub In (data output from main)
-        let miso = pins.gpio21; // ?? MISO is not connected on the TTGO board
-        let cs = pins.gpio5; // Chip Select (active low signal from main to address subs and initiate transmission)
+        let cs = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default()); // Chip Select
+        let dc = Output::new(peripherals.GPIO16, Level::Low, OutputConfig::default()); // Data/Command
+        let rst = Output::new(peripherals.GPIO23, Level::High, OutputConfig::default()); // Reset
 
-        // create SPI interface
-        let spi = spi::Spi::new(
-            spi,
-            sck,
-            mosi,
-            miso,
-            cs,
-            26u32.MHz(),
-            spi::SpiMode::Mode0,
-            &mut system.peripheral_clock_control,
-            &clocks,
-        );
+        // SPI bus: SCLK=GPIO18, MOSI=GPIO19 (MISO/GPIO21 unused, display is write-only)
+        let spi_bus = Spi::new(
+            peripherals.SPI2,
+            SpiConfig::default()
+                .with_frequency(Rate::from_mhz(26))
+                .with_mode(Mode::_0),
+        )
+        .unwrap()
+        .with_sck(peripherals.GPIO18)
+        .with_mosi(peripherals.GPIO19);
 
-        // display interface abstraction from SPI and DC
-        let di = SPIInterfaceNoCS::new(spi, dc);
+        // SpiBus + CS -> SpiDevice; embedded-hal-bus drives CS around each transfer
+        let spi_device = ExclusiveDevice::new_no_delay(spi_bus, cs).unwrap();
+        let di = SpiInterface::new(spi_device, dc, &mut buffer);
 
-        let mut display = mipidsi::Builder::st7789(di)
-            .init(&mut delay, Some(rst))
+        let mut display = Builder::new(ST7789, di)
+            .orientation(Orientation::new())
+            .reset_pin(rst)
+            .init(&mut delay)
             .unwrap();
 
         match display.clear(RgbColor::BLUE) {
@@ -250,15 +257,11 @@ fn main() -> ! {
             Err(_) => println!("Failed to clear screen"),
         }
 
-        // Turn on the backlight
-        bl.set_high().unwrap();
-
-        display
-            .set_orientation(mipidsi::options::Orientation::Portrait(false))
-            .unwrap();
-
         display
     };
+
+    // Turn on the backlight now that the display is initialized
+    bl.set_high();
 
     let mut area = {
         // The TTGO board's screen does not start at offset 0x0, and the physical size is 135x240, instead of 240x320
@@ -296,8 +299,8 @@ fn main() -> ! {
 
     loop {
         {
-            left_button.update(left_button_ctr.is_high().unwrap());
-            right_button.update(right_button_ctr.is_high().unwrap());
+            left_button.update(left_input.is_high());
+            right_button.update(right_input.is_high());
         }
 
         match (left_button.state(), right_button.state()) {
@@ -344,6 +347,6 @@ fn main() -> ! {
 
         game.move_snake(&mut area);
 
-        delay.delay_ms(100u32);
+        delay.delay_millis(100);
     }
 }
