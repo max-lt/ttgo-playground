@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(asm_experimental_arch)] // Xtensa inline asm (waiti) is still nightly-gated
 
 mod snake;
 
@@ -9,12 +10,20 @@ use esp_backtrace as _;
 use esp_println::println;
 use esp_storage::FlashStorage;
 
+use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
+use critical_section::Mutex;
+
 use esp_hal::delay::Delay;
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::gpio::{Event, Input, InputConfig, Io, Level, Output, OutputConfig, Pull};
 use esp_hal::main;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
+use esp_hal::time::Duration;
 use esp_hal::time::Rate;
+use esp_hal::timer::timg::TimerGroup;
+use esp_hal::timer::PeriodicTimer;
+use esp_hal::Blocking;
 
 use core::fmt::Write;
 
@@ -34,47 +43,64 @@ use mipidsi::Builder;
 // The ESP-IDF bootloader (what espflash writes) needs an app descriptor to boot.
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ButtonState {
-    Pressed,
-    JustPressed,
-    Released,
-    JustReleased,
+// --- State shared between the interrupt handlers and main ---
+//
+// Peripherals that raise an IRQ must be acknowledged (`clear_interrupt`) from
+// inside their handler, so the handler needs &mut access. They live behind a
+// `critical_section::Mutex<RefCell<Option<_>>>`: the Mutex disables interrupts
+// while we touch the cell (no race with the ISR), RefCell gives interior
+// mutability, Option lets us fill them in once `main` has built them.
+static BUTTONS: Mutex<RefCell<Option<(Input<'static>, Input<'static>)>>> =
+    Mutex::new(RefCell::new(None));
+static GAME_TIMER: Mutex<RefCell<Option<PeriodicTimer<'static, Blocking>>>> =
+    Mutex::new(RefCell::new(None));
+
+// Events posted by the ISRs and consumed by main. Just signals -> plain atomics,
+// no lock needed.
+static LEFT_PRESSED: AtomicBool = AtomicBool::new(false);
+static RIGHT_PRESSED: AtomicBool = AtomicBool::new(false);
+static TICK: AtomicBool = AtomicBool::new(false);
+
+/// One GPIO interrupt fires for the whole bank, so we check which pin latched it.
+#[esp_hal::handler]
+fn gpio_handler() {
+    critical_section::with(|cs| {
+        let mut buttons = BUTTONS.borrow_ref_mut(cs);
+        if let Some((left, right)) = buttons.as_mut() {
+            if left.is_interrupt_set() {
+                LEFT_PRESSED.store(true, Ordering::Relaxed);
+                left.clear_interrupt();
+            }
+            if right.is_interrupt_set() {
+                RIGHT_PRESSED.store(true, Ordering::Relaxed);
+                right.clear_interrupt();
+            }
+        }
+    });
+}
+
+/// Periodic timer: drives the snake tick, decoupled from the buttons.
+#[esp_hal::handler]
+fn tick_handler() {
+    TICK.store(true, Ordering::Relaxed);
+    critical_section::with(|cs| {
+        if let Some(timer) = GAME_TIMER.borrow_ref_mut(cs).as_mut() {
+            timer.clear_interrupt();
+        }
+    });
 }
 
 struct Button {
-    pin: u8,
     flash_offset: u32,
-    state: ButtonState,
     count: u32,
 }
 
 impl Button {
-    pub fn new(pin: u8, flash_offset: u32) -> Self {
+    pub fn new(flash_offset: u32) -> Self {
         Button {
-            pin,
             flash_offset,
-            state: ButtonState::Released,
             count: 0,
         }
-    }
-
-    pub fn state(&self) -> ButtonState {
-        self.state
-    }
-
-    pub fn update(&mut self, is_high: bool) {
-        // High means the button is not pressed
-        self.state = match is_high {
-            true => match self.state {
-                ButtonState::Pressed | ButtonState::JustPressed => ButtonState::JustReleased,
-                ButtonState::Released | ButtonState::JustReleased => ButtonState::Released,
-            },
-            false => match self.state {
-                ButtonState::Pressed | ButtonState::JustPressed => ButtonState::Pressed,
-                ButtonState::Released | ButtonState::JustReleased => ButtonState::JustPressed,
-            },
-        };
     }
 
     pub fn count(&self) -> u32 {
@@ -191,19 +217,14 @@ fn main() -> ! {
 
     println!("Hello world!");
 
-    // Buttons: GPIO0 (left) and GPIO35 (right), pulled up (low = pressed)
-    let input_config = InputConfig::default().with_pull(Pull::Up);
-    let left_input = Input::new(peripherals.GPIO0, input_config);
-    let right_input = Input::new(peripherals.GPIO35, input_config);
-
     let mut flash = FlashStorage::new(peripherals.FLASH);
     let flash_offset = 0x9000;
     check_memory(&mut flash, flash_offset);
 
-    let mut left_button = Button::new(0, flash_offset + 4);
+    let mut left_button = Button::new(flash_offset + 4);
     left_button.read(&mut flash);
 
-    let mut right_button = Button::new(35, flash_offset + 8);
+    let mut right_button = Button::new(flash_offset + 8);
     right_button.read(&mut flash);
 
     println!(
@@ -213,10 +234,7 @@ fn main() -> ! {
     );
 
     // Buffer used to format text
-    let mut buf = Buf {
-        data: [0u8; 128],
-        len: 0,
-    };
+    let mut buf = Buf::default();
 
     // Backlight pin, kept alive for the whole program. Off until the display is ready.
     let mut bl = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
@@ -297,28 +315,47 @@ fn main() -> ! {
 
     game.init(&mut area);
 
-    loop {
-        {
-            left_button.update(left_input.is_high());
-            right_button.update(right_input.is_high());
-        }
+    // --- Interrupt setup ---
+    // Buttons -> GPIO falling-edge interrupt (low = pressed).
+    let mut io = Io::new(peripherals.IO_MUX);
+    io.set_interrupt_handler(gpio_handler);
 
-        match (left_button.state(), right_button.state()) {
-            // If both buttons are pressed, print counters and save them to flash
-            (ButtonState::JustPressed, ButtonState::JustPressed) => {
-                println!("Both buttons pressed, writing counters to flash");
-                println!(
-                    "Left button count: {}, right button count: {}",
-                    left_button.count(),
-                    right_button.count()
-                );
-                left_button.write(&mut flash);
-                right_button.write(&mut flash);
-            }
-            (ButtonState::JustReleased, ButtonState::JustReleased) => {
-                println!("Both buttons released");
-            }
-            (ButtonState::JustPressed, _) => {
+    let input_config = InputConfig::default().with_pull(Pull::Up);
+    let mut left_input = Input::new(peripherals.GPIO0, input_config);
+    let mut right_input = Input::new(peripherals.GPIO35, input_config);
+
+    critical_section::with(|cs| {
+        left_input.listen(Event::FallingEdge);
+        right_input.listen(Event::FallingEdge);
+        BUTTONS.borrow_ref_mut(cs).replace((left_input, right_input));
+    });
+
+    // Game tick -> periodic timer interrupt (~100 ms), decoupled from the buttons.
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let mut game_timer = PeriodicTimer::new(timg0.timer0);
+    game_timer.set_interrupt_handler(tick_handler);
+
+    // Arm + start + hand off to the static with IRQs masked, so the timer can't
+    // fire before the handler can find it in GAME_TIMER (which would never clear).
+    critical_section::with(|cs| {
+        game_timer.listen();
+        game_timer.start(Duration::from_millis(100)).unwrap();
+        GAME_TIMER.borrow_ref_mut(cs).replace(game_timer);
+    });
+
+    // --- Event loop: no polling, no delay. The CPU sleeps until an IRQ wakes it. ---
+    loop {
+        let left_ev = LEFT_PRESSED.swap(false, Ordering::Relaxed);
+        let right_ev = RIGHT_PRESSED.swap(false, Ordering::Relaxed);
+        let tick = TICK.swap(false, Ordering::Relaxed);
+
+        if left_ev && right_ev {
+            // Both buttons: persist the counters to flash
+            println!("Both buttons pressed, writing counters to flash");
+            left_button.write(&mut flash);
+            right_button.write(&mut flash);
+        } else {
+            if left_ev {
                 left_button.increment();
 
                 write!(buf, "{}", left_button.count()).unwrap();
@@ -329,7 +366,7 @@ fn main() -> ! {
 
                 game.change_direction(snake::DirectionChange::Left);
             }
-            (_, ButtonState::JustPressed) => {
+            if right_ev {
                 right_button.increment();
 
                 write!(buf, "{}", right_button.count()).unwrap();
@@ -340,13 +377,23 @@ fn main() -> ! {
 
                 game.change_direction(snake::DirectionChange::Right);
             }
-            (ButtonState::JustReleased, _) => println!("Left button released"),
-            (_, ButtonState::JustReleased) => println!("Right button released"),
-            _ => {}
         }
 
-        game.move_snake(&mut area);
+        if tick {
+            game.move_snake(&mut area);
+        }
 
-        delay.delay_millis(100);
+        // Sleep until the next interrupt. The critical section makes the
+        // "check flags, then sleep" atomic (an ISR can't set a flag between the
+        // check and the `waiti`, so no wake-up is lost). The 100 ms timer is also
+        // a guaranteed floor: worst case we wake every tick anyway.
+        critical_section::with(|_| {
+            if !LEFT_PRESSED.load(Ordering::Relaxed)
+                && !RIGHT_PRESSED.load(Ordering::Relaxed)
+                && !TICK.load(Ordering::Relaxed)
+            {
+                unsafe { core::arch::asm!("waiti 0") };
+            }
+        });
     }
 }
