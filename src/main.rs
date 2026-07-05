@@ -20,6 +20,7 @@ use esp_hal::main;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
 use esp_hal::time::Duration;
+use esp_hal::time::Instant;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::timer::PeriodicTimer;
@@ -60,6 +61,10 @@ static GAME_TIMER: Mutex<RefCell<Option<PeriodicTimer<'static, Blocking>>>> =
 static LEFT_PRESSED: AtomicBool = AtomicBool::new(false);
 static RIGHT_PRESSED: AtomicBool = AtomicBool::new(false);
 static TICK: AtomicBool = AtomicBool::new(false);
+
+/// Ignore button edges within this window of the last accepted press. Mechanical
+/// bounce is a few ms; 150 ms also blocks accidental double-turns of the snake.
+const DEBOUNCE_MS: u64 = 150;
 
 /// One GPIO interrupt fires for the whole bank, so we check which pin latched it.
 #[esp_hal::handler]
@@ -343,6 +348,10 @@ fn main() -> ! {
         GAME_TIMER.borrow_ref_mut(cs).replace(game_timer);
     });
 
+    // Debounce state: when we last accepted a press for each button.
+    let mut left_last = Instant::now();
+    let mut right_last = Instant::now();
+
     // --- Event loop: no polling, no delay. The CPU sleeps until an IRQ wakes it. ---
     loop {
         let left_ev = LEFT_PRESSED.swap(false, Ordering::Relaxed);
@@ -355,7 +364,8 @@ fn main() -> ! {
             left_button.write(&mut flash);
             right_button.write(&mut flash);
         } else {
-            if left_ev {
+            if left_ev && left_last.elapsed().as_millis() >= DEBOUNCE_MS {
+                left_last = Instant::now();
                 left_button.increment();
 
                 write!(buf, "{}", left_button.count()).unwrap();
@@ -366,7 +376,8 @@ fn main() -> ! {
 
                 game.change_direction(snake::DirectionChange::Left);
             }
-            if right_ev {
+            if right_ev && right_last.elapsed().as_millis() >= DEBOUNCE_MS {
+                right_last = Instant::now();
                 right_button.increment();
 
                 write!(buf, "{}", right_button.count()).unwrap();
