@@ -48,7 +48,7 @@ impl Game {
         }
     }
 
-    fn area<D>(area: &mut D) -> Cropped<D>
+    fn area<D>(area: &mut D) -> Cropped<'_, D>
     where
         D: DrawTarget + Dimensions,
         D::Color: RgbColor,
