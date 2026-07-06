@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(asm_experimental_arch)] // Xtensa inline asm (waiti) is still nightly-gated
 
 mod snake;
 
@@ -8,66 +9,103 @@ use embedded_storage::Storage;
 use esp_backtrace as _;
 use esp_println::println;
 use esp_storage::FlashStorage;
-use hal::clock::ClockControl;
-use hal::peripherals::Peripherals;
-use hal::prelude::*;
-use hal::spi;
-use hal::Delay;
-use hal::IO;
 
-use core::fmt::Formatter;
+use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
+use critical_section::Mutex;
+
+use esp_hal::delay::Delay;
+use esp_hal::gpio::{Event, Input, InputConfig, Io, Level, Output, OutputConfig, Pull};
+use esp_hal::main;
+use esp_hal::spi::master::{Config as SpiConfig, Spi};
+use esp_hal::spi::Mode;
+use esp_hal::time::Duration;
+use esp_hal::time::Instant;
+use esp_hal::time::Rate;
+use esp_hal::timer::timg::TimerGroup;
+use esp_hal::timer::PeriodicTimer;
+use esp_hal::Blocking;
+
 use core::fmt::Write;
 
 // Screen
-use display_interface_spi::SPIInterfaceNoCS;
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::mono_font::{ascii::FONT_10X20, MonoTextStyle};
 use embedded_graphics::pixelcolor::RgbColor;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::*;
 use embedded_graphics::text::Text;
+use embedded_hal_bus::spi::ExclusiveDevice;
+use mipidsi::interface::SpiInterface;
+use mipidsi::models::ST7789;
+use mipidsi::options::Orientation;
+use mipidsi::Builder;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ButtonState {
-    Pressed,
-    JustPressed,
-    Released,
-    JustReleased,
+// The ESP-IDF bootloader (what espflash writes) needs an app descriptor to boot.
+esp_bootloader_esp_idf::esp_app_desc!();
+
+// --- State shared between the interrupt handlers and main ---
+//
+// Peripherals that raise an IRQ must be acknowledged (`clear_interrupt`) from
+// inside their handler, so the handler needs &mut access. They live behind a
+// `critical_section::Mutex<RefCell<Option<_>>>`: the Mutex disables interrupts
+// while we touch the cell (no race with the ISR), RefCell gives interior
+// mutability, Option lets us fill them in once `main` has built them.
+static BUTTONS: Mutex<RefCell<Option<(Input<'static>, Input<'static>)>>> =
+    Mutex::new(RefCell::new(None));
+static GAME_TIMER: Mutex<RefCell<Option<PeriodicTimer<'static, Blocking>>>> =
+    Mutex::new(RefCell::new(None));
+
+// Events posted by the ISRs and consumed by main. Just signals -> plain atomics,
+// no lock needed.
+static LEFT_PRESSED: AtomicBool = AtomicBool::new(false);
+static RIGHT_PRESSED: AtomicBool = AtomicBool::new(false);
+static TICK: AtomicBool = AtomicBool::new(false);
+
+/// Ignore button edges within this window of the last accepted press. Mechanical
+/// bounce is a few ms; 150 ms also blocks accidental double-turns of the snake.
+const DEBOUNCE_MS: u64 = 150;
+
+/// One GPIO interrupt fires for the whole bank, so we check which pin latched it.
+#[esp_hal::handler]
+fn gpio_handler() {
+    critical_section::with(|cs| {
+        let mut buttons = BUTTONS.borrow_ref_mut(cs);
+        if let Some((left, right)) = buttons.as_mut() {
+            if left.is_interrupt_set() {
+                LEFT_PRESSED.store(true, Ordering::Relaxed);
+                left.clear_interrupt();
+            }
+            if right.is_interrupt_set() {
+                RIGHT_PRESSED.store(true, Ordering::Relaxed);
+                right.clear_interrupt();
+            }
+        }
+    });
+}
+
+/// Periodic timer: drives the snake tick, decoupled from the buttons.
+#[esp_hal::handler]
+fn tick_handler() {
+    TICK.store(true, Ordering::Relaxed);
+    critical_section::with(|cs| {
+        if let Some(timer) = GAME_TIMER.borrow_ref_mut(cs).as_mut() {
+            timer.clear_interrupt();
+        }
+    });
 }
 
 struct Button {
-    pin: u8,
     flash_offset: u32,
-    state: ButtonState,
     count: u32,
 }
 
 impl Button {
-    pub fn new(pin: u8, flash_offset: u32) -> Self {
+    pub fn new(flash_offset: u32) -> Self {
         Button {
-            pin,
             flash_offset,
-            state: ButtonState::Released,
             count: 0,
         }
-    }
-
-    pub fn state(&self) -> ButtonState {
-        self.state
-    }
-
-    pub fn update(&mut self, is_high: bool) {
-        // High means the button is not pressed
-        self.state = match is_high {
-            true => match self.state {
-                ButtonState::Pressed | ButtonState::JustPressed => ButtonState::JustReleased,
-                ButtonState::Released | ButtonState::JustReleased => ButtonState::Released,
-            },
-            false => match self.state {
-                ButtonState::Pressed | ButtonState::JustPressed => ButtonState::Pressed,
-                ButtonState::Released | ButtonState::JustReleased => ButtonState::JustPressed,
-            },
-        };
     }
 
     pub fn count(&self) -> u32 {
@@ -78,13 +116,13 @@ impl Button {
         self.count += 1;
     }
 
-    pub fn write(&self, flash: &mut FlashStorage) {
+    pub fn write(&self, flash: &mut FlashStorage<'_>) {
         flash
             .write(self.flash_offset, self.count.to_le_bytes().as_ref())
             .expect("Failed to write to flash");
     }
 
-    pub fn read(&mut self, flash: &mut FlashStorage) {
+    pub fn read(&mut self, flash: &mut FlashStorage<'_>) {
         let mut data = [0u8; 4];
 
         flash
@@ -98,7 +136,7 @@ impl Button {
 const MAGIC: u32 = 0xab01cd02;
 
 /// Check if the magic is written, if not, write it and clear the rest of the used flash
-fn check_memory(flash: &mut FlashStorage, flash_offset: u32) {
+fn check_memory(flash: &mut FlashStorage<'_>, flash_offset: u32) {
     println!("Flash size = {}", flash.capacity());
 
     if flash.capacity() < 128 {
@@ -176,29 +214,22 @@ impl Write for Buf {
     }
 }
 
-#[entry]
+#[main]
 fn main() -> ! {
-    let peripherals = Peripherals::take();
-    let mut system = peripherals.DPORT.split();
-    let clocks = ClockControl::boot_defaults(system.clock_control).freeze();
-    let mut delay = Delay::new(&clocks);
+    let peripherals = esp_hal::init(esp_hal::Config::default());
+
+    let mut delay = Delay::new();
 
     println!("Hello world!");
 
-    let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
-    let pins = io.pins;
-
-    let left_button_ctr = pins.gpio0.into_pull_up_input();
-    let right_button_ctr = pins.gpio35.into_pull_up_input();
-
-    let mut flash = FlashStorage::new();
+    let mut flash = FlashStorage::new(peripherals.FLASH);
     let flash_offset = 0x9000;
     check_memory(&mut flash, flash_offset);
 
-    let mut left_button = Button::new(left_button_ctr.number(), flash_offset + 4);
+    let mut left_button = Button::new(flash_offset + 4);
     left_button.read(&mut flash);
 
-    let mut right_button = Button::new(right_button_ctr.number(), flash_offset + 8);
+    let mut right_button = Button::new(flash_offset + 8);
     right_button.read(&mut flash);
 
     println!(
@@ -208,41 +239,40 @@ fn main() -> ! {
     );
 
     // Buffer used to format text
-    let mut buf = Buf {
-        data: [0u8; 128],
-        len: 0,
-    };
+    let mut buf = Buf::default();
+
+    // Backlight pin, kept alive for the whole program. Off until the display is ready.
+    let mut bl = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
+
+    // Scratch buffer for the mipidsi SPI interface; must outlive `display`.
+    let mut buffer = [0u8; 512];
 
     // Display
     let mut display = {
         // https://github.com/Xinyuan-LilyGO/TTGO-T-Display#pinout
-        let mut bl = pins.gpio4.into_push_pull_output();
-        let rst = pins.gpio23.into_push_pull_output(); // Reset (active low signal from main to reset subs)
-        let dc = pins.gpio16.into_push_pull_output(); // Data/Command (data or command signal from main to subs)
-        let spi = peripherals.SPI2; // Serial Peripheral Interface
-        let sck = pins.gpio18; // SCLK : Serial Clock (clock signal from main)
-        let mosi = pins.gpio19; // mosi: Main Out Sub In (data output from main)
-        let miso = pins.gpio21; // ?? MISO is not connected on the TTGO board
-        let cs = pins.gpio5; // Chip Select (active low signal from main to address subs and initiate transmission)
+        let cs = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default()); // Chip Select
+        let dc = Output::new(peripherals.GPIO16, Level::Low, OutputConfig::default()); // Data/Command
+        let rst = Output::new(peripherals.GPIO23, Level::High, OutputConfig::default()); // Reset
 
-        // create SPI interface
-        let spi = spi::Spi::new(
-            spi,
-            sck,
-            mosi,
-            miso,
-            cs,
-            26u32.MHz(),
-            spi::SpiMode::Mode0,
-            &mut system.peripheral_clock_control,
-            &clocks,
-        );
+        // SPI bus: SCLK=GPIO18, MOSI=GPIO19 (MISO/GPIO21 unused, display is write-only)
+        let spi_bus = Spi::new(
+            peripherals.SPI2,
+            SpiConfig::default()
+                .with_frequency(Rate::from_mhz(26))
+                .with_mode(Mode::_0),
+        )
+        .unwrap()
+        .with_sck(peripherals.GPIO18)
+        .with_mosi(peripherals.GPIO19);
 
-        // display interface abstraction from SPI and DC
-        let di = SPIInterfaceNoCS::new(spi, dc);
+        // SpiBus + CS -> SpiDevice; embedded-hal-bus drives CS around each transfer
+        let spi_device = ExclusiveDevice::new_no_delay(spi_bus, cs).unwrap();
+        let di = SpiInterface::new(spi_device, dc, &mut buffer);
 
-        let mut display = mipidsi::Builder::st7789(di)
-            .init(&mut delay, Some(rst))
+        let mut display = Builder::new(ST7789, di)
+            .orientation(Orientation::new())
+            .reset_pin(rst)
+            .init(&mut delay)
             .unwrap();
 
         match display.clear(RgbColor::BLUE) {
@@ -250,15 +280,11 @@ fn main() -> ! {
             Err(_) => println!("Failed to clear screen"),
         }
 
-        // Turn on the backlight
-        bl.set_high().unwrap();
-
-        display
-            .set_orientation(mipidsi::options::Orientation::Portrait(false))
-            .unwrap();
-
         display
     };
+
+    // Turn on the backlight now that the display is initialized
+    bl.set_high();
 
     let mut area = {
         // The TTGO board's screen does not start at offset 0x0, and the physical size is 135x240, instead of 240x320
@@ -294,28 +320,52 @@ fn main() -> ! {
 
     game.init(&mut area);
 
-    loop {
-        {
-            left_button.update(left_button_ctr.is_high().unwrap());
-            right_button.update(right_button_ctr.is_high().unwrap());
-        }
+    // --- Interrupt setup ---
+    // Buttons -> GPIO falling-edge interrupt (low = pressed).
+    let mut io = Io::new(peripherals.IO_MUX);
+    io.set_interrupt_handler(gpio_handler);
 
-        match (left_button.state(), right_button.state()) {
-            // If both buttons are pressed, print counters and save them to flash
-            (ButtonState::JustPressed, ButtonState::JustPressed) => {
-                println!("Both buttons pressed, writing counters to flash");
-                println!(
-                    "Left button count: {}, right button count: {}",
-                    left_button.count(),
-                    right_button.count()
-                );
-                left_button.write(&mut flash);
-                right_button.write(&mut flash);
-            }
-            (ButtonState::JustReleased, ButtonState::JustReleased) => {
-                println!("Both buttons released");
-            }
-            (ButtonState::JustPressed, _) => {
+    let input_config = InputConfig::default().with_pull(Pull::Up);
+    let mut left_input = Input::new(peripherals.GPIO0, input_config);
+    let mut right_input = Input::new(peripherals.GPIO35, input_config);
+
+    critical_section::with(|cs| {
+        left_input.listen(Event::FallingEdge);
+        right_input.listen(Event::FallingEdge);
+        BUTTONS.borrow_ref_mut(cs).replace((left_input, right_input));
+    });
+
+    // Game tick -> periodic timer interrupt (~100 ms), decoupled from the buttons.
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let mut game_timer = PeriodicTimer::new(timg0.timer0);
+    game_timer.set_interrupt_handler(tick_handler);
+
+    // Arm + start + hand off to the static with IRQs masked, so the timer can't
+    // fire before the handler can find it in GAME_TIMER (which would never clear).
+    critical_section::with(|cs| {
+        game_timer.listen();
+        game_timer.start(Duration::from_millis(100)).unwrap();
+        GAME_TIMER.borrow_ref_mut(cs).replace(game_timer);
+    });
+
+    // Debounce state: when we last accepted a press for each button.
+    let mut left_last = Instant::now();
+    let mut right_last = Instant::now();
+
+    // --- Event loop: no polling, no delay. The CPU sleeps until an IRQ wakes it. ---
+    loop {
+        let left_ev = LEFT_PRESSED.swap(false, Ordering::Relaxed);
+        let right_ev = RIGHT_PRESSED.swap(false, Ordering::Relaxed);
+        let tick = TICK.swap(false, Ordering::Relaxed);
+
+        if left_ev && right_ev {
+            // Both buttons: persist the counters to flash
+            println!("Both buttons pressed, writing counters to flash");
+            left_button.write(&mut flash);
+            right_button.write(&mut flash);
+        } else {
+            if left_ev && left_last.elapsed().as_millis() >= DEBOUNCE_MS {
+                left_last = Instant::now();
                 left_button.increment();
 
                 write!(buf, "{}", left_button.count()).unwrap();
@@ -326,7 +376,8 @@ fn main() -> ! {
 
                 game.change_direction(snake::DirectionChange::Left);
             }
-            (_, ButtonState::JustPressed) => {
+            if right_ev && right_last.elapsed().as_millis() >= DEBOUNCE_MS {
+                right_last = Instant::now();
                 right_button.increment();
 
                 write!(buf, "{}", right_button.count()).unwrap();
@@ -337,13 +388,23 @@ fn main() -> ! {
 
                 game.change_direction(snake::DirectionChange::Right);
             }
-            (ButtonState::JustReleased, _) => println!("Left button released"),
-            (_, ButtonState::JustReleased) => println!("Right button released"),
-            _ => {}
         }
 
-        game.move_snake(&mut area);
+        if tick {
+            game.move_snake(&mut area);
+        }
 
-        delay.delay_ms(100u32);
+        // Sleep until the next interrupt. The critical section makes the
+        // "check flags, then sleep" atomic (an ISR can't set a flag between the
+        // check and the `waiti`, so no wake-up is lost). The 100 ms timer is also
+        // a guaranteed floor: worst case we wake every tick anyway.
+        critical_section::with(|_| {
+            if !LEFT_PRESSED.load(Ordering::Relaxed)
+                && !RIGHT_PRESSED.load(Ordering::Relaxed)
+                && !TICK.load(Ordering::Relaxed)
+            {
+                unsafe { core::arch::asm!("waiti 0") };
+            }
+        });
     }
 }
